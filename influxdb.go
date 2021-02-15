@@ -6,7 +6,7 @@ import (
 	uurl "net/url"
 	"time"
 
-	client "github.com/influxdata/influxdb1-client"
+	"github.com/influxdata/influxdb/client/v2"
 	"github.com/rcrowley/go-metrics"
 )
 
@@ -22,7 +22,7 @@ type reporter struct {
 	password    string
 	tags        map[string]string
 
-	client *client.Client
+	client client.Client
 }
 
 // InfluxDB starts a InfluxDB reporter which will post the metrics from the given registry at each d interval.
@@ -58,11 +58,19 @@ func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measur
 }
 
 func (r *reporter) makeClient() (err error) {
-	r.client, err = client.NewClient(client.Config{
-		URL:      r.url,
-		Username: r.username,
-		Password: r.password,
-	})
+	if r.url.Scheme == "http" {
+		r.client, err = client.NewHTTPClient(client.HTTPConfig{
+			Addr:     r.url.String(),
+			Username: r.username,
+			Password: r.password,
+			Timeout:  10 * time.Second,
+		})
+	} else {
+		r.client, err = client.NewUDPClient(client.UDPConfig{
+			Addr:        r.url.Host,
+			PayloadSize: 512,
+		})
+	}
 
 	return
 }
@@ -78,7 +86,7 @@ func (r *reporter) run() {
 				log.Printf("unable to send metrics to InfluxDB. err=%v", err)
 			}
 		case <-pingTicker:
-			_, _, err := r.client.Ping()
+			_, _, err := r.client.Ping(time.Second)
 			if err != nil {
 				log.Printf("got error while sending a ping to InfluxDB, trying to recreate client. err=%v", err)
 
@@ -91,7 +99,7 @@ func (r *reporter) run() {
 }
 
 func (r *reporter) send() error {
-	var pts []client.Point
+	var pts []*client.Point
 
 	now := time.Now()
 	if r.align {
@@ -102,34 +110,46 @@ func (r *reporter) send() error {
 		switch metric := i.(type) {
 		case metrics.Counter:
 			ms := metric.Snapshot()
-			pts = append(pts, client.Point{
-				Measurement: r.measurement,
-				Tags:        r.tags,
-				Fields: map[string]interface{}{
+			pt, err := client.NewPoint(
+				r.measurement,
+				r.tags,
+				map[string]interface{}{
 					fmt.Sprintf("%s.count", name): ms.Count(),
 				},
-				Time: now,
-			})
+				now,
+			)
+			if err != nil {
+				return
+			}
+			pts = append(pts, pt)
 		case metrics.Gauge:
 			ms := metric.Snapshot()
-			pts = append(pts, client.Point{
-				Measurement: r.measurement,
-				Tags:        r.tags,
-				Fields: map[string]interface{}{
+			pt, err := client.NewPoint(
+				r.measurement,
+				r.tags,
+				map[string]interface{}{
 					fmt.Sprintf("%s.gauge", name): ms.Value(),
 				},
-				Time: now,
-			})
+				now,
+			)
+			if err != nil {
+				return
+			}
+			pts = append(pts, pt)
 		case metrics.GaugeFloat64:
 			ms := metric.Snapshot()
-			pts = append(pts, client.Point{
-				Measurement: r.measurement,
-				Tags:        r.tags,
-				Fields: map[string]interface{}{
+			pt, err := client.NewPoint(
+				r.measurement,
+				r.tags,
+				map[string]interface{}{
 					fmt.Sprintf("%s.gauge", name): ms.Value(),
 				},
-				Time: now,
-			})
+				now,
+			)
+			if err != nil {
+				return
+			}
+			pts = append(pts, pt)
 		case metrics.Histogram:
 			ms := metric.Snapshot()
 			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999, 0.9999})
@@ -148,15 +168,18 @@ func (r *reporter) send() error {
 				"p9999":    ps[5],
 			}
 			for k, v := range fields {
-				pts = append(pts, client.Point{
-					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
-					Fields: map[string]interface{}{
+				pt, err := client.NewPoint(
+					r.measurement,
+					bucketTags(k, r.tags),
+					map[string]interface{}{
 						fmt.Sprintf("%s.histogram", name): v,
 					},
-					Time: now,
-				})
-
+					now,
+				)
+				if err != nil {
+					continue
+				}
+				pts = append(pts, pt)
 			}
 		case metrics.Meter:
 			ms := metric.Snapshot()
@@ -168,14 +191,18 @@ func (r *reporter) send() error {
 				"mean":  ms.RateMean(),
 			}
 			for k, v := range fields {
-				pts = append(pts, client.Point{
-					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
-					Fields: map[string]interface{}{
+				pt, err := client.NewPoint(
+					r.measurement,
+					bucketTags(k, r.tags),
+					map[string]interface{}{
 						fmt.Sprintf("%s.meter", name): v,
 					},
-					Time: now,
-				})
+					now,
+				)
+				if err != nil {
+					continue
+				}
+				pts = append(pts, pt)
 			}
 
 		case metrics.Timer:
@@ -200,24 +227,29 @@ func (r *reporter) send() error {
 				"meanrate": ms.RateMean(),
 			}
 			for k, v := range fields {
-				pts = append(pts, client.Point{
-					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
-					Fields: map[string]interface{}{
+				pt, err := client.NewPoint(
+					r.measurement,
+					bucketTags(k, r.tags),
+					map[string]interface{}{
 						fmt.Sprintf("%s.timer", name): v,
 					},
-					Time: now,
-				})
+					now,
+				)
+				if err != nil {
+					continue
+				}
+				pts = append(pts, pt)
 			}
 		}
 	})
 
-	bps := client.BatchPoints{
-		Points:   pts,
-		Database: r.database,
-	}
+	retryBatch, _ := client.NewBatchPoints(client.BatchPointsConfig{
+		Database:  r.database,
+		Precision: "s",
+	})
+	retryBatch.AddPoints(pts)
 
-	_, err := r.client.Write(bps)
+	err := r.client.Write(retryBatch)
 	return err
 }
 
