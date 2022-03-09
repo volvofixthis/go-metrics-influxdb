@@ -5,6 +5,8 @@ This is a reporter for the [go-metrics](https://github.com/rcrowley/go-metrics) 
 
 This version adds a measurement for the metrics, moves the histogram bucket names into tags, similar to the behavior of hitograms in telegraf, and aligns all metrics in a batch on the same timestamp.
 
+This version supports sending metrics over UDP.
+
 Additionally, metrics can be aligned to the beginning of a bucket as defined by the interval.
 
 Setting align to true will cause the timestamp to be truncated down to the nearest even integral of the reporting interval.
@@ -22,7 +24,7 @@ Usage
 -----
 
 ```go
-import "github.com/jregovic/go-metrics-influxdb"
+import "github.com/volvofixthis/go-metrics-influxdb"
 
 go influxdb.InfluxDBWithTags(
     metrics.DefaultRegistry,    // metrics registry
